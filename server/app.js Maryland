@@ -1,0 +1,138 @@
+const express = require('express');
+const mongoose = require('mongoose');
+const dotenv = require('dotenv');
+const cors = require('cors');
+const bcrypt = require('bcryptjs');
+const nodemailer = require('nodemailer');
+
+dotenv.config();
+
+const app = express();
+app.use(cors({ origin: '*' })); // Allow all origins explicitly
+app.use(express.json());
+
+// Add a root route for status verification
+app.get('/', (req, res) => {
+    res.send('<h1>NeoPulse Auth Server is Running!</h1><p>The API endpoints are active at /api/signup and /api/verify-otp</p>');
+});
+
+// --- DATABASE SETUP (With Fallback for Testing) ---
+let isUsingMockDB = false;
+let mockUsers = []; // Temporary in-memory storage if MongoDB is unavailable
+
+mongoose.connect(process.env.MONGODB_URI)
+    .then(() => console.log('✅ Connected to MongoDB Atlas'))
+    .catch(err => {
+        console.error('❌ MongoDB Connection Error:', err.message);
+        console.log('⚠️ SWITCHING TO MOCK DATABASE MODE (In-memory)');
+        console.log('NOTE: Users will be lost when the server restarts.');
+        isUsingMockDB = true;
+    });
+
+// User Schema (Mongoose)
+const userSchema = new mongoose.Schema({
+    email: { type: String, required: true, unique: true },
+    password: { type: String, required: true },
+    otp: { type: String },
+    otpExpires: { type: Date },
+    isVerified: { type: Boolean, default: false }
+});
+const User = mongoose.model('User', userSchema);
+
+// --- NODEMAILER SETUP ---
+const transporter = nodemailer.createTransport({
+    service: 'gmail',
+    auth: {
+        user: process.env.EMAIL_USER,
+        pass: process.env.EMAIL_PASS
+    }
+});
+
+// --- HELPER: FIND USER ---
+const findUserByEmail = async (email) => {
+    if (isUsingMockDB) return mockUsers.find(u => u.email === email);
+    return await User.findOne({ email });
+};
+
+// --- HELPER: SAVE USER ---
+const saveUser = async (userData) => {
+    if (isUsingMockDB) {
+        const index = mockUsers.findIndex(u => u.email === userData.email);
+        if (index > -1) mockUsers[index] = { ...mockUsers[index], ...userData };
+        else mockUsers.push({ ...userData, _id: Date.now().toString() });
+        return mockUsers.find(u => u.email === userData.email);
+    }
+    let user = await User.findOne({ email: userData.email });
+    if (!user) user = new User(userData);
+    else Object.assign(user, userData);
+    return await user.save();
+};
+
+// --- SIGNUP API ---
+app.post('/api/signup', async (req, res) => {
+    try {
+        const { email, password } = req.body;
+        // Removed "User already exists" check as requested. 
+        // We will strictly allow re-signup and overwrite with a new OTP.
+
+        const hashedPassword = await bcrypt.hash(password, 10);
+        const otp = Math.floor(100000 + Math.random() * 900000).toString();
+        const otpExpires = new Date(Date.now() + 5 * 60 * 1000); // 5 mins
+
+        user = await saveUser({
+            email,
+            password: hashedPassword,
+            otp,
+            otpExpires,
+            isVerified: false
+        });
+
+        // Try to send real email, but always log to console
+        console.log(`\n-----------------------------------`);
+        console.log(`📧 OTP for ${email}: ${otp}`);
+        console.log(`-----------------------------------\n`);
+
+        const mailOptions = {
+            from: process.env.EMAIL_USER,
+            to: email,
+            subject: 'NeoPulse Verification Code',
+            text: `Your OTP is: ${otp}. Valid for 5 minutes.`
+        };
+
+        transporter.sendMail(mailOptions, (err) => {
+            if (err) console.log('Note: Email sending failed. Use the OTP from console above.');
+        });
+
+        res.status(201).json({ message: 'OTP generated. Please verify.' });
+    } catch (error) {
+        res.status(500).json({ message: 'Server error', error: error.message });
+    }
+});
+
+// --- VERIFY OTP API ---
+app.post('/api/verify-otp', async (req, res) => {
+    try {
+        const { email, otp } = req.body;
+        const user = await findUserByEmail(email);
+
+        if (!user) return res.status(400).json({ message: 'User not found' });
+        if (user.otp !== otp) return res.status(400).json({ message: 'Invalid OTP' });
+        if (new Date(user.otpExpires) < new Date()) return res.status(400).json({ message: 'OTP expired' });
+
+        await saveUser({ ...user, isVerified: true, otp: undefined, otpExpires: undefined });
+
+        res.status(200).json({ message: 'Account verified successfully' });
+    } catch (error) {
+        res.status(500).json({ message: 'Server error', error: error.message });
+    }
+});
+
+const PORT = process.env.PORT || 5001;
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`🚀 Server running on http://127.0.0.1:${PORT}`);
+});
+
+// Simple interval to keep the process alive in some environments
+setInterval(() => {
+    // Keep alive
+}, 1000 * 60 * 60);
